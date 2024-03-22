@@ -29,7 +29,6 @@
 
 #include "Client.h"
 #include "QNEthernet.h"
-using namespace qindesign::network;
 
 #if defined(STD_FUNCTION_MIDDLEWARE)
 #include <functional>
@@ -82,6 +81,8 @@ using namespace qindesign::network;
 #endif
 
 namespace awot {
+
+using qindesign::network::EthernetClient;
 
 class StreamClient : public Client {
  private:
