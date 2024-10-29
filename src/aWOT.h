@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "Client.h"
+#include "QNEthernet.h"
 
 #if defined(STD_FUNCTION_MIDDLEWARE)
 #include <functional>
@@ -80,6 +81,8 @@
 #endif
 
 namespace awot {
+
+using qindesign::network::EthernetClient;
 
 class StreamClient : public Client {
  private:
@@ -141,7 +144,7 @@ class Response : public Print {
   void writeP(const unsigned char* data, size_t length);
 
  private:
-  Response(Client* client,   uint8_t * writeBuffer, int writeBufferLength);
+  Response(EthernetClient* client,   uint8_t * writeBuffer, int writeBufferLength);
 
   void m_printStatus(int code);
   bool m_shouldPrintHeaders();
@@ -150,7 +153,7 @@ class Response : public Print {
   void m_flushBuf();
   void m_finalize();
 
-  Client* m_stream;
+  EthernetClient* m_stream;
   struct Headers {
     const char* name;
     const char* value;
@@ -208,7 +211,7 @@ class Request : public Stream {
     HeaderNode* next;
   };
 
-  Request(Client* client, Response* m_response, HeaderNode* headerTail,
+  Request(EthernetClient* client, Response* m_response, HeaderNode* headerTail,
               char* urlBuffer, int urlBufferLength, unsigned long timeout,
               void* context);
   bool m_processMethod();
@@ -227,7 +230,7 @@ class Request : public Stream {
   int m_timedRead();
   bool m_timedout();
 
-  Client* m_stream;
+  EthernetClient* m_stream;
   Response* m_response;
   MethodType m_method;
   int m_minorVersion;
@@ -319,9 +322,9 @@ class Application {
   void post(Router::MIDDLEWARE_PARAM middleware);
   void put(const char* path, Router::MIDDLEWARE_PARAM middleware);
   void put(Router::MIDDLEWARE_PARAM middleware);
-  void process(Client* client, void* context = NULL);
-  void process(Client* client, char* urlbuffer, int urlBufferLength, void* context = NULL);
-  void process(Client* client, char* urlBuffer, int urlBufferLength, uint8_t * writeBuffer, int writeBufferLength, void* context = NULL);
+  void process(EthernetClient* client, void* context = NULL);
+  void process(EthernetClient* client, char* urlbuffer, int urlBufferLength, void* context = NULL);
+  void process(EthernetClient* client, char* urlBuffer, int urlBufferLength, uint8_t * writeBuffer, int writeBufferLength, void* context = NULL);
   void process(Stream* stream, void* context = NULL);
   void process(Stream* stream, char* urlbuffer, int urlBufferLength, void* context = NULL);
   void process(Stream* stream, char* urlBuffer, int urlBufferLength, uint8_t * writeBuffer, int writeBufferLength, void* context = NULL);

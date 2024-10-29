@@ -1,6 +1,6 @@
 {
   "name": "aWOT",
-  "version": "3.5.0",
+  "version": "3.5.1",
   "keywords": "wifi, ethernet, http, web, server, rest",
   "description": "aWOT is a web server library compatible with multiple different board architectures and networking solutions.",
   "license": "MIT",
@@ -8,7 +8,7 @@
   "repository":
   {
     "type": "git",
-    "url": "https://github.com/lasselukkari/aWOT.git"
+    "url": "https://github.com/anabrid/aWOT.git"
   },
   "frameworks": "arduino",
   "platforms":
