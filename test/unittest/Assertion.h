@@ -1,9 +1,5 @@
 #pragma once
 
-#ifndef typeof
-#define typeof __typeof__
-#endif
-
 #include "Compare.h"
 
 #define arduinoCITestBehaviorExp(die, desc, pass) \
@@ -19,7 +15,7 @@
 #define arduinoCITestBehaviorOp(die, desc, rel1, arg1, op, op_name, rel2, arg2) \
   do                                                                   \
   {                                                                    \
-    if (!assertion<typeof(arg1), typeof(arg2)>(__FILE__, __LINE__,     \
+    if (!assertion<decltype(arg1), decltype(arg2)>(__FILE__, __LINE__,     \
                                                desc,                   \
                                                rel1, #arg1, (arg1),    \
                                                op_name, op,            \
