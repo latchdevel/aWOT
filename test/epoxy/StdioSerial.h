@@ -30,13 +30,6 @@ typedef int FileDescriptor;
  * A version of Serial that reads from STDIN and sends output to STDOUT or
  * STDERR on Linux, MacOS or Windows.
  */
-
-// Class to enumerate the two output options: STDOUT or STDERR
-enum class StdioOutput { 
-  STDOUT, 
-  STDERR 
-};
-
 class StdioSerial: public Stream {
   public:
     /**
