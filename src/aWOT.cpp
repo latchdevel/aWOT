@@ -35,9 +35,11 @@ Response::Response(Client* client, uint8_t * writeBuffer, int writeBufferLength)
       m_headersCount(0),
       m_bytesSent(0),
       m_ended(false),
+      m_writeStalled(false), // TEG patch-2: bound the response write.
       m_buffer(writeBuffer),
       m_bufferLength(writeBufferLength),
       m_bufFill(0) {}
+
 
 int Response::availableForWrite() {
   return SERVER_OUTPUT_BUFFER_SIZE - m_bufFill - 1;
@@ -199,7 +201,15 @@ size_t Response::write(uint8_t data) {
       m_stream->print(CRLF);
     }
 
-    m_stream->write(m_buffer, SERVER_OUTPUT_BUFFER_SIZE);
+    // TEF Patch-2/3: bounded, like m_flushBuf(). This path fires whenever the output buffer fills,
+    // so it carries the bulk of any large response.
+    if (!m_writeBounded(m_buffer, SERVER_OUTPUT_BUFFER_SIZE)) {
+      m_writeStalled = true;
+      m_ended = true;
+      m_stream->stop();
+      m_bufFill = 0;
+      return sizeof(data); // report accepted; the response is already abandoned
+    }
 
     if (m_headersSent && !m_contentLengthSet) {
       m_stream->print(CRLF);
@@ -221,11 +231,23 @@ size_t Response::write(uint8_t *buffer, size_t bufferLength) {
   m_flushBuf();
 
   if (m_headersSent && !m_contentLengthSet) {
-    m_stream->print(bufferLength, HEX);
+    // TEF patch-2/3: Cast is load-bearing. Print has print(unsigned int, int) and print(unsigned long, int)
+    // but nothing taking size_t, so on any target where size_t is wider than
+    // unsigned long the call is ambiguous and will not compile. It happened to resolve
+    // on Teensy (size_t == unsigned int) and on Linux x86_64 (size_t == unsigned long)
+    // while the library was pinned to those; it is not portable in general.
+    m_stream->print((unsigned long)bufferLength, HEX);
     m_stream->print(CRLF);
   }
-
-  m_stream->write(buffer, bufferLength);
+  // TEF patch-2/3: bounded, like m_flushBuf(). This is the bulk-write path used by sendAsset() and the
+  // capture download, so it is the one a stalled reader is most likely to sit on.
+  if (!m_writeBounded(buffer, bufferLength)) {
+    m_writeStalled = true;
+    m_ended = true;
+    m_stream->stop();
+    m_bytesSent += bufferLength;
+    return bufferLength; // report accepted; the response is already abandoned
+  }
 
   if (m_headersSent && !m_contentLengthSet) {
     m_stream->print(CRLF);
@@ -670,14 +692,81 @@ void Response::m_printHeaders() {
 
 void Response::m_printCRLF() { print(CRLF); }
 
+// TEG patch-2: defaults, 3s is far longer than any healthy peer needs to accept a 512-byte
+// buffer over LAN Ethernet, and short enough that even several consecutive stalled
+// flushes stay clear of the 8s watchdog when no service callback is wired.
+unsigned long Response::s_writeBudgetMs = 3000;
+void (*Response::s_serviceFn)() = NULL;
+
+// TEG patch-2: bounded, serviced.
+// Returns false if the peer stopped accepting data within the budget.
+bool Response::m_writeBounded(const uint8_t *buf, size_t size) {
+  // The budget measures time WITHOUT PROGRESS, not total time in this call.
+  // Budgeting total time looks equivalent and is not. Client::write() may legally
+  // accept only part of what it is offered, so a large body is delivered over many
+  // partial writes with a yield() between them; a peer that is reading steadily but
+  // slowly - a congested link, or the 2MB capture download - accumulates elapsed time
+  // without ever stalling, and would have its response truncated at the budget. That is
+  // the very truncation the switch to writeFully() was made to fix, reintroduced under
+  // a different trigger. A host test caught it: 3000 bytes at 7 bytes per write lost
+  // more than half the body.
+  //
+  // Resetting the deadline on every byte accepted keeps the anti-hang guarantee intact -
+  // a peer that has genuinely stopped reading accepts nothing, so the timer never
+  // resets and still trips at the budget - while a peer that is making progress is
+  // never cut off.
+  unsigned long lastProgress = millis();
+  size_t rem = size;
+  while (rem > 0) {
+    if (s_serviceFn != NULL) {
+      s_serviceFn();
+    }
+    size_t w = m_stream->write(buf, rem);
+    if (w > rem) {
+      w = rem; // a Client must never claim more than it was offered; rem is unsigned
+    }
+    rem -= w;
+    buf += w;
+    if (rem == 0) {
+      return true;
+    }
+    if (w > 0) {
+      lastProgress = millis(); // peer is draining, just not in one go
+    }
+    if (!m_stream->connected()) {
+      return false; // peer gone; nothing more will ever be accepted
+    }
+    // Signed comparison so the millis() wrap at ~49 days cannot extend the budget.
+    if ((long)(millis() - lastProgress) >= (long)s_writeBudgetMs) {
+      return false; // peer alive but not reading - do not spin on it
+    }
+    yield(); // QNEthernet services its stack from here
+  }
+  return true;
+}
+
 void Response::m_flushBuf() {
   if (m_bufFill > 0) {
+    // Once a flush has timed out, keep draining the buffer without touching the
+    // socket. The handler then finishes at full speed instead of stalling again on
+    // every remaining chunk, and the connection is torn down when it returns.
+    if (m_writeStalled) {
+      m_bufFill = 0;
+      return;
+    }
+
     if (m_headersSent && !m_contentLengthSet) {
       m_stream->print(m_bufFill, HEX);
       m_stream->print(CRLF);
     }
 
-    m_stream->write(m_buffer, m_bufFill);
+    if (!m_writeBounded(m_buffer, m_bufFill)) {
+      m_writeStalled = true;
+      m_ended = true;
+      m_stream->stop(); // release the socket rather than leaving it half-open
+      m_bufFill = 0;
+      return;
+    }
 
     if (m_headersSent && !m_contentLengthSet) {
       m_stream->print(CRLF);

@@ -148,6 +148,7 @@ class Response : public Print {
   void m_printHeaders();
   void m_printCRLF();
   void m_flushBuf();
+  bool m_writeBounded(const uint8_t *buf, size_t size); // TEG patch-2: bound the response write.
   void m_finalize();
 
   Client* m_stream;
@@ -165,6 +166,27 @@ class Response : public Print {
   int m_headersCount;
   int m_bytesSent;
   bool m_ended;
+
+  // TEG patch-2: bound the response write.
+  // A client that completes a request and then simply stops reading advertises a zero
+  // TCP window, write() returns 0 for ever, and nothing services the watchdog - an
+  // unauthenticated one-request reset of a running inverter, on any GET.
+  //
+  // m_writeStalled latches once the budget is exhausted, so the handler runs to
+  // completion quickly against a discarded buffer instead of blocking on every
+  // subsequent chunk.
+  bool m_writeStalled;
+  static unsigned long s_writeBudgetMs;
+  static void (*s_serviceFn)();
+
+ public:
+  // Bound how long a single buffer flush may spend waiting for the peer, and give the
+  // wait something to call (a watchdog kick / control-task service). Defaults keep a
+  // budget but no callback.
+  static void setWriteBudget(unsigned long ms) { s_writeBudgetMs = ms; }
+  static void setServiceCallback(void (*fn)()) { s_serviceFn = fn; }
+
+ private:
   uint8_t * m_buffer;
   int m_bufferLength;
   int m_bufFill;
