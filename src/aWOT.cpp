@@ -22,6 +22,21 @@
 
 #include "aWOT.h"
 
+namespace {
+int hexNibble(int ch) {
+  if (ch >= '0' && ch <= '9') {
+    return ch - '0';
+  }
+  if (ch >= 'A' && ch <= 'F') {
+    return ch - 'A' + 10;
+  }
+  if (ch >= 'a' && ch <= 'f') {
+    return ch - 'a' + 10;
+  }
+  return -1;
+}
+}  // namespace
+
 Response::Response(Client* client, uint8_t * writeBuffer, int writeBufferLength)
     : m_stream(client),
       m_headers(),
@@ -35,12 +50,18 @@ Response::Response(Client* client, uint8_t * writeBuffer, int writeBufferLength)
       m_headersCount(0),
       m_bytesSent(0),
       m_ended(false),
+      m_writeStalled(false), // TEG patch-2: bound the response write.
+      // Absolute ceiling starts ticking when the response object is created, i.e.
+      // once per request, so it bounds the whole response rather than each buffer.
+      m_writeDeadline(millis() + s_writeTotalBudgetMs),
       m_buffer(writeBuffer),
       m_bufferLength(writeBufferLength),
       m_bufFill(0) {}
 
+
 int Response::availableForWrite() {
-  return SERVER_OUTPUT_BUFFER_SIZE - m_bufFill - 1;
+  const int available = m_bufferLength - m_bufFill - 1;
+  return available > 0 ? available : 0;
 }
 
 void Response::beginHeaders() {
@@ -83,7 +104,7 @@ void Response::flush() {
 const char *Response::get(const char *name) {
   for (int i = 0; i < m_headersCount; i++) {
     if (Application::strcmpi(name, m_headers[i].name) == 0) {
-      return m_headers[m_headersCount].value;
+      return m_headers[i].value;
     }
   }
 
@@ -191,15 +212,41 @@ size_t Response::write(uint8_t data) {
     m_printHeaders();
   }
 
+  // Application::process() rejects null/empty buffers before constructing a
+  // Response. Honour the actual caller-supplied capacity here: using the
+  // compile-time default silently overflowed smaller custom buffers.
   m_buffer[m_bufFill++] = data;
 
-  if (m_bufFill == SERVER_OUTPUT_BUFFER_SIZE) {
+  if (m_bufFill == m_bufferLength) {
+    // Discard once stalled, exactly as m_flushBuf() does. Without this entry check the
+    // socket is re-entered on every subsequent buffer, so boundedness depends on the
+    // concrete client making connected() false after stop() - which QNEthernet does but
+    // aWOT's own StreamClient does not (its stop() is a no-op and connected() is always
+    // 1). Measured that way, a 3000-byte body burned one FULL budget per buffer.
+    if (m_writeStalled) {
+      m_bufFill = 0;
+      m_bytesSent += (int)sizeof(data);
+      return sizeof(data);
+    }
+
     if (m_headersSent && !m_contentLengthSet) {
       m_stream->print(m_bufFill, HEX);
       m_stream->print(CRLF);
     }
 
-    m_stream->write(m_buffer, SERVER_OUTPUT_BUFFER_SIZE);
+    // TEF Patch-2/3: bounded, like m_flushBuf(). This path fires whenever the output buffer fills,
+    // so it carries the bulk of any large response.
+    if (!m_writeBounded(m_buffer, static_cast<size_t>(m_bufferLength))) {
+      m_writeStalled = true;
+      m_ended = true;
+      m_stream->stop();
+      m_bufFill = 0;
+      // Count it like the success path below, so the two overloads agree. bytesSent()
+      // is what the handler produced, not what reached the peer - stalled() is how a
+      // caller tells the difference.
+      m_bytesSent += (int)sizeof(data);
+      return sizeof(data); // report accepted; the response is already abandoned
+    }
 
     if (m_headersSent && !m_contentLengthSet) {
       m_stream->print(CRLF);
@@ -224,12 +271,30 @@ size_t Response::writeF(uint8_t *buffer, size_t bufferLength) {
 
   m_flushBuf();
 
-  if (m_headersSent && !m_contentLengthSet) {
-    m_stream->print(bufferLength, HEX);
-    m_stream->print(CRLF);
+  // Discard once stalled, for the same reason as the byte path above.
+  if (m_writeStalled) {
+    m_bytesSent += bufferLength;
+    return bufferLength;
   }
 
-  m_stream->write(buffer, bufferLength);
+  if (m_headersSent && !m_contentLengthSet) {
+    // TEF patch-2/3: Cast is load-bearing. Print has print(unsigned int, int) and print(unsigned long, int)
+    // but nothing taking size_t, so on any target where size_t is wider than
+    // unsigned long the call is ambiguous and will not compile. It happened to resolve
+    // on Teensy (size_t == unsigned int) and on Linux x86_64 (size_t == unsigned long)
+    // while the library was pinned to those; it is not portable in general.
+    m_stream->print((unsigned long)bufferLength, HEX);
+    m_stream->print(CRLF);
+  }
+  // TEF patch-2/3: bounded, like m_flushBuf(). This is the bulk-write path used by sendAsset() and the
+  // capture download, so it is the one a stalled reader is most likely to sit on.
+  if (!m_writeBounded(buffer, bufferLength)) {
+    m_writeStalled = true;
+    m_ended = true;
+    m_stream->stop();
+    m_bytesSent += bufferLength;
+    return bufferLength; // report accepted; the response is already abandoned
+  }
 
   if (m_headersSent && !m_contentLengthSet) {
     m_stream->print(CRLF);
@@ -674,14 +739,99 @@ void Response::m_printHeaders() {
 
 void Response::m_printCRLF() { print(CRLF); }
 
+// TEG patch-2: defaults, 3s is far longer than any healthy peer needs to accept a 512-byte
+// buffer over LAN Ethernet, and short enough that even several consecutive stalled
+// flushes stay clear of the 8s watchdog when no service callback is wired.
+unsigned long Response::s_writeBudgetMs = 3000;
+// 30 s for one whole response. Generous next to any real transfer on a LAN - the
+// 2MB capture download needs well under a second at link speed - and short enough
+// that a starved MQTT/NTP/OTA/config-persist path recovers on its own. The
+// no-progress budget above cannot bound this on its own; see aWOT.h.
+unsigned long Response::s_writeTotalBudgetMs = 30000;
+void (*Response::s_serviceFn)() = NULL;
+
+// TEG patch-2: bounded, serviced.
+// Returns false if the peer stopped accepting data within the budget.
+bool Response::m_writeBounded(const uint8_t *buf, size_t size) {
+  // The budget measures time WITHOUT PROGRESS, not total time in this call.
+  // Budgeting total time looks equivalent and is not. Client::write() may legally
+  // accept only part of what it is offered, so a large body is delivered over many
+  // partial writes with a yield() between them; a peer that is reading steadily but
+  // slowly - a congested link, or the 2MB capture download - accumulates elapsed time
+  // without ever stalling, and would have its response truncated at the budget. That is
+  // the very truncation the switch to writeFully() was made to fix, reintroduced under
+  // a different trigger. A host test caught it: 3000 bytes at 7 bytes per write lost
+  // more than half the body.
+  //
+  // Resetting the deadline on every byte accepted keeps the anti-hang guarantee intact -
+  // a peer that has genuinely stopped reading accepts nothing, so the timer never
+  // resets and still trips at the budget - while a peer that is making progress is
+  // never cut off.
+  unsigned long lastProgress = millis();
+  size_t rem = size;
+  while (rem > 0) {
+    if (s_serviceFn != NULL) {
+      s_serviceFn();
+    }
+    const size_t w = m_stream->write(buf, rem);
+    if (w > rem) {
+      // A Client must never claim more than it was offered. Treat it as a hard
+      // error rather than clamping to rem: clamping would make the loop exit with
+      // rem == 0 and report success, turning a broken client into exactly the
+      // silent truncation this function exists to prevent. rem is unsigned, so
+      // subtracting an over-large w would also run buf off the end of the buffer.
+      return false;
+    }
+    rem -= w;
+    buf += w;
+    if (rem == 0) {
+      return true;
+    }
+    if (w > 0) {
+      lastProgress = millis(); // peer is draining, just not in one go
+    }
+    if (!m_stream->connected()) {
+      return false; // peer gone; nothing more will ever be accepted
+    }
+    // Signed comparisons throughout, so the millis() wrap at ~49 days cannot extend
+    // either budget.
+    if ((long)(millis() - lastProgress) >= (long)s_writeBudgetMs) {
+      return false; // peer alive but not reading - do not spin on it
+    }
+    if ((long)(millis() - m_writeDeadline) >= 0) {
+      // The absolute ceiling. Without it, reset-on-progress means a peer that
+      // accepts one byte per budget-minus-epsilon holds this loop indefinitely -
+      // measured at ~24 s for a 200-byte body at an 80 ms drip, and unbounded by
+      // construction. Progress alone is not evidence of good faith.
+      return false;
+    }
+    yield(); // QNEthernet services its stack from here
+  }
+  return true;
+}
+
 void Response::m_flushBuf() {
   if (m_bufFill > 0) {
+    // Once a flush has timed out, keep draining the buffer without touching the
+    // socket. The handler then finishes at full speed instead of stalling again on
+    // every remaining chunk, and the connection is torn down when it returns.
+    if (m_writeStalled) {
+      m_bufFill = 0;
+      return;
+    }
+
     if (m_headersSent && !m_contentLengthSet) {
       m_stream->print(m_bufFill, HEX);
       m_stream->print(CRLF);
     }
 
-    m_stream->write(m_buffer, m_bufFill);
+    if (!m_writeBounded(m_buffer, m_bufFill)) {
+      m_writeStalled = true;
+      m_ended = true;
+      m_stream->stop(); // release the socket rather than leaving it half-open
+      m_bufFill = 0;
+      return;
+    }
 
     if (m_headersSent && !m_contentLengthSet) {
       m_stream->print(CRLF);
@@ -719,18 +869,31 @@ Request::Request(Client* client, Response* m_response, HeaderNode* headerTail,
       m_queryLength(0),
       m_readTimedout(false),
       m_path(urlBuffer),
-      m_pathLength(urlBufferLength - 1),
+      m_pathLength(urlBufferLength),
       m_pattern(NULL),
       m_route(NULL){
         _timeout = timeout;
+        m_headerDeadline = millis() + s_headerBudgetMs; // TEG patch-1.
       }
+
+// TEG patch-1 defaults. 4s is enormously generous for a real client - headers arrive
+// in milliseconds - and stays clear of the 8s watchdog even if no service callback
+// is wired, so the defense does not depend on the application remembering to.
+unsigned long Request::s_headerBudgetMs = 4000;
+void (*Request::s_serviceFn)() = NULL;
 
 int Request::availableForWrite() {
   return m_response->availableForWrite();
 }
 
 int Request::available() {
-  return min(m_stream->available(), m_left + m_pushbackDepth);
+  const int remaining = m_left + m_pushbackDepth;
+  if (remaining <= 0) {
+    return 0;
+  }
+
+  const int streamAvailable = m_stream->available();
+  return streamAvailable > 0 ? min(streamAvailable, remaining) : 0;
 }
 
 int Request::bytesRead() { return m_bytesRead; }
@@ -756,9 +919,15 @@ void Request::flush() {
 }
 
 bool Request::form(char *name, int nameLength, char *value, int valueLength) {
+  if (name == NULL || value == NULL || nameLength <= 0 || valueLength <= 0) {
+    return false;
+  }
+
   int ch;
   bool foundSomething = false;
   bool readingName = true;
+  bool nameFits = true;
+  bool valueFits = true;
 
   memset(name, 0, nameLength);
   memset(value, 0, valueLength);
@@ -771,7 +940,7 @@ bool Request::form(char *name, int nameLength, char *value, int valueLength) {
       readingName = false;
       continue;
     } else if (ch == '&') {
-      return nameLength > 0 && valueLength > 0;
+      return nameFits && valueFits;
     } else if (ch == '%') {
       int high = m_timedRead();
       if (high == -1) {
@@ -783,29 +952,35 @@ bool Request::form(char *name, int nameLength, char *value, int valueLength) {
         return false;
       }
 
-      if (high > 0x39) {
-        high -= 7;
+      high = hexNibble(high);
+      low = hexNibble(low);
+      if (high < 0 || low < 0) {
+        return false;
       }
-
-      high &= 0x0f;
-
-      if (low > 0x39) {
-        low -= 7;
-      }
-
-      low &= 0x0f;
 
       ch = (high << 4) | low;
+      if (ch == 0 || ch == '\r' || ch == '\n' || ch == 0x7f) {
+        return false;
+      }
     }
 
-    if (readingName && --nameLength) {
-      *name++ = ch;
-    } else if (!readingName && --valueLength) {
+    if (readingName) {
+      if (nameLength > 1) {
+        *name++ = ch;
+        --nameLength;
+      } else {
+        nameFits = false;
+      }
+    } else if (valueLength > 1) {
+      *value++ = ch;
+      --valueLength;
+    } else {
+      valueFits = false;
       *value++ = ch;
     }
   }
 
-  return foundSomething && nameLength > 0 && valueLength > 0;
+  return foundSomething && nameFits && valueFits;
 }
 
 int Request::left() { return m_left + m_pushbackDepth; }
@@ -836,13 +1011,18 @@ void Request::push(uint8_t ch) {
 char *Request::query() { return m_query; }
 
 bool Request::query(const char *name, char *buffer, int bufferLength) {
+  if (name == NULL || *name == '\0' || buffer == NULL || bufferLength <= 0 ||
+      m_query == NULL) {
+    return false;
+  }
+
   memset(buffer, 0, bufferLength);
 
   char *position = m_query;
   int nameLength = strlen(name);
 
   while ((position = strstr(position, name))) {
-    char previous = *(position - 1);
+    char previous = position == m_query ? '\0' : *(position - 1);
 
     if ((previous == '\0' || previous == '&') &&
         *(position + nameLength) == '=') {
@@ -886,13 +1066,21 @@ int Request::read() {
 int Request::read(uint8_t* buf, size_t size) {
   int ret = 0;
 
-  while (m_pushbackDepth > 0) {
+  while (m_pushbackDepth > 0 && size > 0) {
     *buf++ = m_pushback[--m_pushbackDepth];
     size--;
     ret++;
   }
 
-  int read = m_stream->read(buf, (size < (unsigned)m_left ? size : m_left));
+
+  if (size == 0 || (m_readingContent && m_left <= 0)) {
+    return ret;
+  }
+
+  const size_t readable = m_readingContent && size > static_cast<size_t>(m_left)
+                        ? static_cast<size_t>(m_left)
+                        : size;
+  int read = m_stream->read(buf, readable);
   if (read == -1) {
     if (ret > 0) {
       return ret;
@@ -909,6 +1097,11 @@ int Request::read(uint8_t* buf, size_t size) {
 }
 
 bool Request::route(const char *name, char *buffer, int bufferLength) {
+  if (name == NULL || *name == '\0' || buffer == NULL || bufferLength <= 0 ||
+      m_pattern == NULL || m_route == NULL) {
+    return false;
+  }
+
   int part = 0;
   int i = 1;
 
@@ -935,6 +1128,10 @@ bool Request::route(const char *name, char *buffer, int bufferLength) {
 }
 
 bool Request::route(int number, char *buffer, int bufferLength) {
+  if (number < 0 || buffer == NULL || bufferLength <= 0 || m_route == NULL) {
+    return false;
+  }
+
   memset(buffer, 0, bufferLength);
   int part = -1;
   const char *routeStart = m_route;
@@ -1005,8 +1202,19 @@ bool Request::m_readURL() {
   int bufferLeft = m_pathLength;
   int ch;
 
-  while ((ch = m_timedRead()) != -1 && ch != ' ' && ch != '\n' && ch != '\r' &&
-         --bufferLeft) {
+  if (request == NULL || bufferLeft <= 1) {
+    return false;
+  }
+
+  while ((ch = m_timedRead()) != -1) {
+    if (ch == ' ') {
+      *request = 0;
+      return request != m_path;
+    }
+    if (ch < 0x20 || ch == 0x7f || bufferLeft <= 1) {
+      return false;
+    }
+
     if (ch == '%') {
       int high = m_timedRead();
       if (high == -1) {
@@ -1018,44 +1226,38 @@ bool Request::m_readURL() {
         return false;
       }
 
-      if (high > 0x39) {
-        high -= 7;
+      high = hexNibble(high);
+      low = hexNibble(low);
+      if (high < 0 || low < 0) {
+        return false;
       }
-
-      high &= 0x0f;
-
-      if (low > 0x39) {
-        low -= 7;
-      }
-
-      low &= 0x0f;
 
       ch = (high << 4) | low;
+      if (ch == 0 || ch < 0x20 || ch == 0x7f) {
+        return false;
+      }
     }
 
     *request++ = ch;
+    --bufferLeft;
   }
 
-  *request = 0;
-
-  return bufferLeft > 0;
+ return false;
 }
 
 bool Request::m_readVersion() {
-  while (!m_expect(CRLF)) {
-    P(HTTP_10) = "1.0";
-    P(HTTP_11) = "1.1";
+  P(HTTP_10) = "HTTP/1.0";
+  P(HTTP_11) = "HTTP/1.1";
 
-    if (m_expectP(HTTP_10)) {
-      m_minorVersion = 0;
-    } else if (m_expectP(HTTP_11)) {
-      m_minorVersion = 1;
-    } else if (m_timedRead() == -1) {
-      return false;
-    }
+  if (m_expectP(HTTP_10)) {
+    m_minorVersion = 0;
+  } else if (m_expectP(HTTP_11)) {
+    m_minorVersion = 1;
+  } else {
+    return false;
   }
 
-  return true;
+  return m_expect(CRLF);
 }
 
 void Request::m_processURL() {
@@ -1073,17 +1275,35 @@ void Request::m_processURL() {
 
 bool Request::m_processHeaders() {
   bool canEnd = true;
+  bool contentLengthSeen = false;
 
   while (!(canEnd && m_expect(CRLF))) {
     canEnd = false;
     P(ContentLength) = "Content-Length:";
     if (m_expectP(ContentLength)) {
-      if (!m_readInt(m_left) || !m_expect(CRLF)) {
+      int contentLength = 0;
+      if (!m_readInt(contentLength) || !m_expect(CRLF)) {
         return false;
       }
 
+      // Multiple differing lengths and Transfer-Encoding ambiguity are classic
+      // request-smuggling inputs. Identical duplicate lengths are harmless and
+      // accepted for compatibility; any conflict is rejected before dispatch.
+      if (contentLengthSeen && contentLength != m_left) {
+        return false;
+      }
+      m_left = contentLength;
+      contentLengthSeen = true;
+
       canEnd = true;
     } else {
+      P(TransferEncoding) = "Transfer-Encoding:";
+      if (m_expectP(TransferEncoding)) {
+        // aWOT has no chunked-request decoder. Never reinterpret a chunked body
+        // as an unframed request or combine it with Content-Length.
+        return false;
+      }
+
       HeaderNode *headerNode = m_headerTail;
 
       while (headerNode != NULL) {
@@ -1120,8 +1340,18 @@ bool Request::m_processHeaders() {
 bool Request::m_headerValue(char *buffer, int bufferLength) {
   int ch;
 
+  if (buffer == NULL || bufferLength <= 0) {
+    return false;
+  }
+
   if (buffer[0] != '\0') {
     int length = strlen(buffer);
+    // A repeated header needs room for the comma and the final NUL.  The old code
+    // replaced a full buffer's terminator with a comma, advanced past the object,
+    // and later wrote the new terminator one byte out of bounds.
+    if (length + 2 > bufferLength) {
+      return false;
+    }
     buffer[length] = ',';
     buffer = buffer + length + 1;
     bufferLength = bufferLength - (length + 1);
@@ -1158,19 +1388,22 @@ bool Request::m_readInt(int &number) {
     return false;
   }
 
-  if (ch == '-') {
-    negate = true;
-    ch = m_timedRead();
-    if (ch == -1) {
-      return false;
-    }
+  // Content-Length is a non-negative decimal value.  Accepting a leading minus
+  // left m_left negative; available() then remained truthy after peer close and
+  // body-drain loops never terminated.
+  if (ch == '-' || ch == '+') {
+    return false;
   }
 
   number = 0;
 
   while (ch >= '0' && ch <= '9') {
     gotNumber = true;
-    number = number * 10 + ch - '0';
+    const int digit = ch - '0';
+    if (number > (INT_MAX - digit) / 10) {
+      return false;
+    }
+    number = number * 10 + digit;
     ch = m_timedRead();
     if (ch == -1) {
       return false;
@@ -1265,12 +1498,34 @@ void Request::m_reset() {
 bool Request::m_timedout() { return m_readTimedout; }
 
 int Request::m_timedRead() {
-  int ch = timedRead();
-  if (ch == -1) {
-    m_readTimedout = true;
+  // TEG patch-1: replaces Stream::timedRead(). Same per-byte timeout, but the wait
+  // services the caller's callback (watchdog) and the header phase as a whole is bounded.
+  const unsigned long start = millis();
+  for (;;) {
+    if (s_serviceFn != NULL) {
+      s_serviceFn();
+    }
+    // read(), not m_stream->read(). This is the virtual Request::read(), which drains
+    // the pushback buffer the parser uses for lookahead, honours content-length
+    // exhaustion, and decrements m_left as the body is consumed. Going straight to the
+    // stream skips all three and mis-parses requests.
+    const int ch = read();
+    if (ch >= 0) {
+      return ch;
+    }
+    const unsigned long now = millis();
+    if (now - start >= _timeout) {
+      break; // per-byte timeout, upstream behaviour
+    }
+    // Signed comparison so the millis() rollover cannot extend the budget. Not
+    // applied to the body: a firmware upload is legitimately slow and its handler
+    // services the watchdog itself.
+    if (!m_readingContent && static_cast<long>(now - m_headerDeadline) >= 0) {
+      break;
+    }
   }
-
-  return ch;
+  m_readTimedout = true;
+  return -1;
 }
 
 Router::Router()
@@ -1401,7 +1656,13 @@ void Router::m_dispatchMiddleware(Request &request, Response &response, int urlS
       int prefixLength = middleware->path ? strlen(middleware->path) : 0;
       int shift = urlShift + prefixLength;
 
-      if (middleware->path == NULL || strncmp(middleware->path, request.path() + urlShift, prefixLength) == 0) {
+      const char *remaining = request.path() + urlShift;
+      const bool prefixMatches = middleware->path == NULL ||
+          strncmp(middleware->path, remaining, prefixLength) == 0;
+      const bool segmentBoundary = prefixLength == 0 ||
+          middleware->path[prefixLength - 1] == '/' ||
+          remaining[prefixLength] == '\0' || remaining[prefixLength] == '/';
+      if (prefixMatches && segmentBoundary) {
         middleware->router->m_dispatchMiddleware(request, response, shift);
       }
     } else if (middleware->type == request.method() || middleware->type == Request::ALL) {
@@ -1602,7 +1863,20 @@ void Application::process(Client *client, char *urlBuffer, int urlBufferLength, 
     return;
   }
 
+  if (writeBuffer == NULL || writeBufferLength <= 0) {
+    // There is no safe way to format even an error response without storage.
+    // Close a real network client and leave all caller memory untouched.
+    client->stop();
+    return;
+  }
+
   Response response(client, writeBuffer, writeBufferLength);
+ if (urlBuffer == NULL || urlBufferLength <= 1) {
+    response.sendStatus(414);
+    response.m_finalize();
+    return;
+  }
+
   Request request(client, &response, m_headerTail, urlBuffer, urlBufferLength,
                   m_timeout, context);
 
