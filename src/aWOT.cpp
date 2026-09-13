@@ -22,6 +22,21 @@
 
 #include "aWOT.h"
 
+namespace {
+int hexNibble(int ch) {
+  if (ch >= '0' && ch <= '9') {
+    return ch - '0';
+  }
+  if (ch >= 'A' && ch <= 'F') {
+    return ch - 'A' + 10;
+  }
+  if (ch >= 'a' && ch <= 'f') {
+    return ch - 'a' + 10;
+  }
+  return -1;
+}
+}  // namespace
+
 Response::Response(Client* client, uint8_t * writeBuffer, int writeBufferLength)
     : m_stream(client),
       m_headers(),
@@ -45,7 +60,8 @@ Response::Response(Client* client, uint8_t * writeBuffer, int writeBufferLength)
 
 
 int Response::availableForWrite() {
-  return SERVER_OUTPUT_BUFFER_SIZE - m_bufFill - 1;
+  const int available = m_bufferLength - m_bufFill - 1;
+  return available > 0 ? available : 0;
 }
 
 void Response::beginHeaders() {
@@ -88,7 +104,7 @@ void Response::flush() {
 const char *Response::get(const char *name) {
   for (int i = 0; i < m_headersCount; i++) {
     if (Application::strcmpi(name, m_headers[i].name) == 0) {
-      return m_headers[m_headersCount].value;
+      return m_headers[i].value;
     }
   }
 
@@ -196,9 +212,12 @@ size_t Response::write(uint8_t data) {
     m_printHeaders();
   }
 
+  // Application::process() rejects null/empty buffers before constructing a
+  // Response. Honour the actual caller-supplied capacity here: using the
+  // compile-time default silently overflowed smaller custom buffers.
   m_buffer[m_bufFill++] = data;
 
-  if (m_bufFill == SERVER_OUTPUT_BUFFER_SIZE) {
+  if (m_bufFill == m_bufferLength) {
     // Discard once stalled, exactly as m_flushBuf() does. Without this entry check the
     // socket is re-entered on every subsequent buffer, so boundedness depends on the
     // concrete client making connected() false after stop() - which QNEthernet does but
@@ -217,7 +236,7 @@ size_t Response::write(uint8_t data) {
 
     // TEF Patch-2/3: bounded, like m_flushBuf(). This path fires whenever the output buffer fills,
     // so it carries the bulk of any large response.
-    if (!m_writeBounded(m_buffer, SERVER_OUTPUT_BUFFER_SIZE)) {
+    if (!m_writeBounded(m_buffer, static_cast<size_t>(m_bufferLength))) {
       m_writeStalled = true;
       m_ended = true;
       m_stream->stop();
@@ -846,7 +865,7 @@ Request::Request(Client* client, Response* m_response, HeaderNode* headerTail,
       m_queryLength(0),
       m_readTimedout(false),
       m_path(urlBuffer),
-      m_pathLength(urlBufferLength - 1),
+      m_pathLength(urlBufferLength),
       m_pattern(NULL),
       m_route(NULL){
         _timeout = timeout;
@@ -889,9 +908,15 @@ void Request::flush() {
 }
 
 bool Request::form(char *name, int nameLength, char *value, int valueLength) {
+  if (name == NULL || value == NULL || nameLength <= 0 || valueLength <= 0) {
+    return false;
+  }
+
   int ch;
   bool foundSomething = false;
   bool readingName = true;
+  bool nameFits = true;
+  bool valueFits = true;
 
   memset(name, 0, nameLength);
   memset(value, 0, valueLength);
@@ -904,7 +929,7 @@ bool Request::form(char *name, int nameLength, char *value, int valueLength) {
       readingName = false;
       continue;
     } else if (ch == '&') {
-      return nameLength > 0 && valueLength > 0;
+      return nameFits && valueFits;
     } else if (ch == '%') {
       int high = m_timedRead();
       if (high == -1) {
@@ -916,29 +941,35 @@ bool Request::form(char *name, int nameLength, char *value, int valueLength) {
         return false;
       }
 
-      if (high > 0x39) {
-        high -= 7;
+      high = hexNibble(high);
+      low = hexNibble(low);
+      if (high < 0 || low < 0) {
+        return false;
       }
-
-      high &= 0x0f;
-
-      if (low > 0x39) {
-        low -= 7;
-      }
-
-      low &= 0x0f;
 
       ch = (high << 4) | low;
+      if (ch == 0 || ch == '\r' || ch == '\n' || ch == 0x7f) {
+        return false;
+      }
     }
 
-    if (readingName && --nameLength) {
-      *name++ = ch;
-    } else if (!readingName && --valueLength) {
+    if (readingName) {
+      if (nameLength > 1) {
+        *name++ = ch;
+        --nameLength;
+      } else {
+        nameFits = false;
+      }
+    } else if (valueLength > 1) {
+      *value++ = ch;
+      --valueLength;
+    } else {
+      valueFits = false;
       *value++ = ch;
     }
   }
 
-  return foundSomething && nameLength > 0 && valueLength > 0;
+  return foundSomething && nameFits && valueFits;
 }
 
 int Request::left() { return m_left + m_pushbackDepth; }
@@ -969,13 +1000,18 @@ void Request::push(uint8_t ch) {
 char *Request::query() { return m_query; }
 
 bool Request::query(const char *name, char *buffer, int bufferLength) {
+  if (name == NULL || *name == '\0' || buffer == NULL || bufferLength <= 0 ||
+      m_query == NULL) {
+    return false;
+  }
+
   memset(buffer, 0, bufferLength);
 
   char *position = m_query;
   int nameLength = strlen(name);
 
   while ((position = strstr(position, name))) {
-    char previous = *(position - 1);
+    char previous = position == m_query ? '\0' : *(position - 1);
 
     if ((previous == '\0' || previous == '&') &&
         *(position + nameLength) == '=') {
@@ -1050,6 +1086,11 @@ int Request::read(uint8_t* buf, size_t size) {
 }
 
 bool Request::route(const char *name, char *buffer, int bufferLength) {
+  if (name == NULL || *name == '\0' || buffer == NULL || bufferLength <= 0 ||
+      m_pattern == NULL || m_route == NULL) {
+    return false;
+  }
+
   int part = 0;
   int i = 1;
 
@@ -1076,6 +1117,10 @@ bool Request::route(const char *name, char *buffer, int bufferLength) {
 }
 
 bool Request::route(int number, char *buffer, int bufferLength) {
+  if (number < 0 || buffer == NULL || bufferLength <= 0 || m_route == NULL) {
+    return false;
+  }
+
   memset(buffer, 0, bufferLength);
   int part = -1;
   const char *routeStart = m_route;
@@ -1142,8 +1187,19 @@ bool Request::m_readURL() {
   int bufferLeft = m_pathLength;
   int ch;
 
-  while ((ch = m_timedRead()) != -1 && ch != ' ' && ch != '\n' && ch != '\r' &&
-         --bufferLeft) {
+  if (request == NULL || bufferLeft <= 1) {
+    return false;
+  }
+
+  while ((ch = m_timedRead()) != -1) {
+    if (ch == ' ') {
+      *request = 0;
+      return request != m_path;
+    }
+    if (ch < 0x20 || ch == 0x7f || bufferLeft <= 1) {
+      return false;
+    }
+
     if (ch == '%') {
       int high = m_timedRead();
       if (high == -1) {
@@ -1155,44 +1211,38 @@ bool Request::m_readURL() {
         return false;
       }
 
-      if (high > 0x39) {
-        high -= 7;
+      high = hexNibble(high);
+      low = hexNibble(low);
+      if (high < 0 || low < 0) {
+        return false;
       }
-
-      high &= 0x0f;
-
-      if (low > 0x39) {
-        low -= 7;
-      }
-
-      low &= 0x0f;
 
       ch = (high << 4) | low;
+      if (ch == 0 || ch < 0x20 || ch == 0x7f) {
+        return false;
+      }
     }
 
     *request++ = ch;
+    --bufferLeft;
   }
 
-  *request = 0;
-
-  return bufferLeft > 0;
+ return false;
 }
 
 bool Request::m_readVersion() {
-  while (!m_expect(CRLF)) {
-    P(HTTP_10) = "1.0";
-    P(HTTP_11) = "1.1";
+  P(HTTP_10) = "HTTP/1.0";
+  P(HTTP_11) = "HTTP/1.1";
 
-    if (m_expectP(HTTP_10)) {
-      m_minorVersion = 0;
-    } else if (m_expectP(HTTP_11)) {
-      m_minorVersion = 1;
-    } else if (m_timedRead() == -1) {
-      return false;
-    }
+  if (m_expectP(HTTP_10)) {
+    m_minorVersion = 0;
+  } else if (m_expectP(HTTP_11)) {
+    m_minorVersion = 1;
+  } else {
+    return false;
   }
 
-  return true;
+  return m_expect(CRLF);
 }
 
 void Request::m_processURL() {
@@ -1210,17 +1260,35 @@ void Request::m_processURL() {
 
 bool Request::m_processHeaders() {
   bool canEnd = true;
+  bool contentLengthSeen = false;
 
   while (!(canEnd && m_expect(CRLF))) {
     canEnd = false;
     P(ContentLength) = "Content-Length:";
     if (m_expectP(ContentLength)) {
-      if (!m_readInt(m_left) || !m_expect(CRLF)) {
+      int contentLength = 0;
+      if (!m_readInt(contentLength) || !m_expect(CRLF)) {
         return false;
       }
 
+      // Multiple differing lengths and Transfer-Encoding ambiguity are classic
+      // request-smuggling inputs. Identical duplicate lengths are harmless and
+      // accepted for compatibility; any conflict is rejected before dispatch.
+      if (contentLengthSeen && contentLength != m_left) {
+        return false;
+      }
+      m_left = contentLength;
+      contentLengthSeen = true;
+
       canEnd = true;
     } else {
+      P(TransferEncoding) = "Transfer-Encoding:";
+      if (m_expectP(TransferEncoding)) {
+        // aWOT has no chunked-request decoder. Never reinterpret a chunked body
+        // as an unframed request or combine it with Content-Length.
+        return false;
+      }
+
       HeaderNode *headerNode = m_headerTail;
 
       while (headerNode != NULL) {
@@ -1551,7 +1619,13 @@ void Router::m_dispatchMiddleware(Request &request, Response &response, int urlS
       int prefixLength = middleware->path ? strlen(middleware->path) : 0;
       int shift = urlShift + prefixLength;
 
-      if (middleware->path == NULL || strncmp(middleware->path, request.path() + urlShift, prefixLength) == 0) {
+      const char *remaining = request.path() + urlShift;
+      const bool prefixMatches = middleware->path == NULL ||
+          strncmp(middleware->path, remaining, prefixLength) == 0;
+      const bool segmentBoundary = prefixLength == 0 ||
+          middleware->path[prefixLength - 1] == '/' ||
+          remaining[prefixLength] == '\0' || remaining[prefixLength] == '/';
+      if (prefixMatches && segmentBoundary) {
         middleware->router->m_dispatchMiddleware(request, response, shift);
       }
     } else if (middleware->type == request.method() || middleware->type == Request::ALL) {
@@ -1752,7 +1826,20 @@ void Application::process(Client *client, char *urlBuffer, int urlBufferLength, 
     return;
   }
 
+  if (writeBuffer == NULL || writeBufferLength <= 0) {
+    // There is no safe way to format even an error response without storage.
+    // Close a real network client and leave all caller memory untouched.
+    client->stop();
+    return;
+  }
+
   Response response(client, writeBuffer, writeBufferLength);
+ if (urlBuffer == NULL || urlBufferLength <= 1) {
+    response.sendStatus(414);
+    response.m_finalize();
+    return;
+  }
+
   Request request(client, &response, m_headerTail, urlBuffer, urlBufferLength,
                   m_timeout, context);
 
