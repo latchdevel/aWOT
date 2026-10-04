@@ -21,6 +21,7 @@
 */
 
 #include "aWOT.h"
+#include <limits.h>
 
 namespace {
 int hexNibble(int ch) {
@@ -50,7 +51,7 @@ Response::Response(Client* client, uint8_t * writeBuffer, int writeBufferLength)
       m_headersCount(0),
       m_bytesSent(0),
       m_ended(false),
-      m_writeStalled(false), // TEG patch-2: bound the response write.
+      m_writeStalled(false), // TEG patch: bound the response write.
       // Absolute ceiling starts ticking when the response object is created, i.e.
       // once per request, so it bounds the whole response rather than each buffer.
       m_writeDeadline(millis() + s_writeTotalBudgetMs),
@@ -220,9 +221,8 @@ size_t Response::write(uint8_t data) {
   if (m_bufFill == m_bufferLength) {
     // Discard once stalled, exactly as m_flushBuf() does. Without this entry check the
     // socket is re-entered on every subsequent buffer, so boundedness depends on the
-    // concrete client making connected() false after stop() - which QNEthernet does but
-    // aWOT's own StreamClient does not (its stop() is a no-op and connected() is always
-    // 1). Measured that way, a 3000-byte body burned one FULL budget per buffer.
+    // concrete client making connected() false after stop().
+    // Measured that way, a 3000-byte body burned one FULL budget per buffer.
     if (m_writeStalled) {
       m_bufFill = 0;
       m_bytesSent += (int)sizeof(data);
@@ -278,7 +278,7 @@ size_t Response::writeF(uint8_t *buffer, size_t bufferLength) {
   }
 
   if (m_headersSent && !m_contentLengthSet) {
-    // TEF patch-2/3: Cast is load-bearing. Print has print(unsigned int, int) and print(unsigned long, int)
+    // TEF patch: Cast is load-bearing. Print has print(unsigned int, int) and print(unsigned long, int)
     // but nothing taking size_t, so on any target where size_t is wider than
     // unsigned long the call is ambiguous and will not compile. It happened to resolve
     // on Teensy (size_t == unsigned int) and on Linux x86_64 (size_t == unsigned long)
@@ -286,7 +286,7 @@ size_t Response::writeF(uint8_t *buffer, size_t bufferLength) {
     m_stream->print((unsigned long)bufferLength, HEX);
     m_stream->print(CRLF);
   }
-  // TEF patch-2/3: bounded, like m_flushBuf(). This is the bulk-write path used by sendAsset() and the
+  // TEF patch: bounded, like m_flushBuf(). This is the bulk-write path used by sendAsset() and the
   // capture download, so it is the one a stalled reader is most likely to sit on.
   if (!m_writeBounded(buffer, bufferLength)) {
     m_writeStalled = true;
@@ -739,7 +739,7 @@ void Response::m_printHeaders() {
 
 void Response::m_printCRLF() { print(CRLF); }
 
-// TEG patch-2: defaults, 3s is far longer than any healthy peer needs to accept a 512-byte
+// TEG patch: defaults 3s is far longer than any healthy peer needs to accept a 512-byte
 // buffer over LAN Ethernet, and short enough that even several consecutive stalled
 // flushes stay clear of the 8s watchdog when no service callback is wired.
 unsigned long Response::s_writeBudgetMs = 3000;
@@ -750,7 +750,7 @@ unsigned long Response::s_writeBudgetMs = 3000;
 unsigned long Response::s_writeTotalBudgetMs = 30000;
 void (*Response::s_serviceFn)() = NULL;
 
-// TEG patch-2: bounded, serviced.
+// TEG patch: bounded, serviced.
 // Returns false if the peer stopped accepting data within the budget.
 bool Response::m_writeBounded(const uint8_t *buf, size_t size) {
   // The budget measures time WITHOUT PROGRESS, not total time in this call.
@@ -805,7 +805,7 @@ bool Response::m_writeBounded(const uint8_t *buf, size_t size) {
       // construction. Progress alone is not evidence of good faith.
       return false;
     }
-    yield(); // QNEthernet services its stack from here
+    yield(); // For compatibility with systems that require it.
   }
   return true;
 }
@@ -873,10 +873,10 @@ Request::Request(Client* client, Response* m_response, HeaderNode* headerTail,
       m_pattern(NULL),
       m_route(NULL){
         _timeout = timeout;
-        m_headerDeadline = millis() + s_headerBudgetMs; // TEG patch-1.
+        m_headerDeadline = millis() + s_headerBudgetMs; // TEG patch.
       }
 
-// TEG patch-1 defaults. 4s is enormously generous for a real client - headers arrive
+// TEG patch: defaults 4s is enormously generous for a real client - headers arrive
 // in milliseconds - and stays clear of the 8s watchdog even if no service callback
 // is wired, so the defense does not depend on the application remembering to.
 unsigned long Request::s_headerBudgetMs = 4000;
@@ -1498,7 +1498,7 @@ void Request::m_reset() {
 bool Request::m_timedout() { return m_readTimedout; }
 
 int Request::m_timedRead() {
-  // TEG patch-1: replaces Stream::timedRead(). Same per-byte timeout, but the wait
+  // TEG patch: replaces Stream::timedRead(). Same per-byte timeout, but the wait
   // services the caller's callback (watchdog) and the header phase as a whole is bounded.
   const unsigned long start = millis();
   for (;;) {

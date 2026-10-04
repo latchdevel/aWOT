@@ -149,7 +149,7 @@ class Response : public Print {
   void m_printHeaders();
   void m_printCRLF();
   void m_flushBuf();
-  bool m_writeBounded(const uint8_t *buf, size_t size); // TEG patch-2: bound the response write.
+  bool m_writeBounded(const uint8_t *buf, size_t size); // TEG patch: bound the response write.
   void m_finalize();
 
   Client* m_stream;
@@ -168,7 +168,7 @@ class Response : public Print {
   int m_bytesSent;
   bool m_ended;
 
-  // TEG patch-2: bound the response write.
+  // TEG patch: bound the response write.
   // A client that completes a request and then simply stops reading advertises a zero
   // TCP window, write() returns 0 for ever, and nothing services the watchdog - an
   // unauthenticated one-request reset of a running inverter, on any GET.
@@ -293,7 +293,7 @@ class Request : public Stream {
   int m_queryLength;
   bool m_readTimedout;
 
-  // TEG patch-1: slow-loris defense.
+  // TEG patch: slow-loris defense.
   // Upstream has a per-BYTE timeout only, and Arduino's Stream::timedRead()
   // busy-waits for it. A client sending one header byte just inside that window
   // resets the timer every time, so the header phase never ends - and each wait
