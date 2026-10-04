@@ -29,6 +29,16 @@
 
 #include "Client.h"
 
+// Workaround for Arduino DUE (SAM architecture) compatibility.
+// The SAM core 'Print.h' / 'Stream.h' classes do not declare 'availableForWrite()' 
+// and 'flush()' as virtual methods. Using 'override' directly causes a compilation 
+// error on this architecture.
+#if defined(ARDUINO_ARCH_SAM)
+  #define DUE_COMPAT_OVERRIDE
+#else
+  #define DUE_COMPAT_OVERRIDE override
+#endif
+
 #if defined(STD_FUNCTION_MIDDLEWARE)
 #include <functional>
 #define MIDDLEWARE_PARAM  Middleware
@@ -120,13 +130,13 @@ class Response : public Print {
   friend class Router;
 
  public:
-  int availableForWrite() override;
+  int availableForWrite() DUE_COMPAT_OVERRIDE;
   int bytesSent();
   void beginHeaders();
   void end();
   void endHeaders();
   bool ended();
-  void flush() override;
+  void flush() DUE_COMPAT_OVERRIDE;
   const char* get(const char* name);
   bool headersSent();
   void printP(const unsigned char* string);
@@ -230,7 +240,7 @@ class Request : public Stream {
   void* context;
 
   int available() override;
-  int availableForWrite() override;
+  int availableForWrite() DUE_COMPAT_OVERRIDE;
   int bytesRead();
   Stream* stream();
   void flush() override;
