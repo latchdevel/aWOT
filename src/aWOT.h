@@ -29,6 +29,16 @@
 
 #include "Client.h"
 
+// Workaround for Arduino DUE (SAM architecture) compatibility.
+// The SAM core 'Print.h' / 'Stream.h' classes do not declare 'availableForWrite()' 
+// and 'flush()' as virtual methods. Using 'override' directly causes a compilation 
+// error on this architecture.
+#if defined(ARDUINO_ARCH_SAM)
+  #define DUE_COMPAT_OVERRIDE
+#else
+  #define DUE_COMPAT_OVERRIDE override
+#endif
+
 #if defined(STD_FUNCTION_MIDDLEWARE)
 #include <functional>
 #define MIDDLEWARE_PARAM  Middleware
@@ -120,13 +130,13 @@ class Response : public Print {
   friend class Router;
 
  public:
-  int availableForWrite();
+  int availableForWrite() DUE_COMPAT_OVERRIDE;
   int bytesSent();
   void beginHeaders();
   void end();
   void endHeaders();
   bool ended();
-  void flush();
+  void flush() DUE_COMPAT_OVERRIDE;
   const char* get(const char* name);
   bool headersSent();
   void printP(const unsigned char* string);
@@ -136,8 +146,9 @@ class Response : public Print {
   void setDefaults();
   void status(int code);
   int statusSent();
-  size_t write(uint8_t data);
-  size_t write(uint8_t* buffer, size_t bufferLength);
+  size_t write(uint8_t data) override;
+  size_t write(const uint8_t* buffer, size_t bufferLength) override;
+  size_t writeF(uint8_t* buffer, size_t bufferLength); // flush buffer
   void writeP(const unsigned char* data, size_t length);
 
  private:
@@ -148,6 +159,7 @@ class Response : public Print {
   void m_printHeaders();
   void m_printCRLF();
   void m_flushBuf();
+  bool m_writeBounded(const uint8_t *buf, size_t size); // TEG patch: bound the response write.
   void m_finalize();
 
   Client* m_stream;
@@ -165,6 +177,55 @@ class Response : public Print {
   int m_headersCount;
   int m_bytesSent;
   bool m_ended;
+
+  // TEG patch: bound the response write.
+  // A client that completes a request and then simply stops reading advertises a zero
+  // TCP window, write() returns 0 for ever, and nothing services the watchdog - an
+  // unauthenticated one-request reset of a running inverter, on any GET.
+  //
+  // m_writeStalled latches once a budget is exhausted, so the handler runs to
+  // completion quickly against a discarded buffer instead of blocking on every
+  // subsequent chunk.
+    //
+  // TWO budgets are needed, and having only one is a trap this patch fell into twice:
+  //
+  //   s_writeBudgetMs   - time with the peer accepting NOTHING. Reset on every byte,
+  //                       so a slow-but-honest peer is never truncated. On its own it
+  //                       bounds nothing: a peer that takes one byte just inside the
+  //                       window holds the loop for ever, which is the same slow-drip
+  //                       attack the header phase already defends against with an
+  //                       absolute deadline (see m_headerDeadline below).
+  //   m_writeDeadline   - an absolute per-response ceiling from s_writeTotalBudgetMs.
+  //                       This is what actually bounds the hold. Control tasks keep
+  //                       running via s_serviceFn, but everything else in loop() -
+  //                       MQTT, NTP, metrics, the deferred OTA commit, the config
+  //                       persist, the display - starves until the response ends.
+  //
+  // Budgeting only total time truncates healthy slow peers; budgeting only progress
+  // bounds nothing. Both, together, are the whole fix.
+  bool m_writeStalled;
+  unsigned long m_writeDeadline;
+  static unsigned long s_writeBudgetMs;
+  static unsigned long s_writeTotalBudgetMs;
+  static void (*s_serviceFn)();
+
+ public:
+  // Bound how long a single buffer flush may spend waiting for a peer that is
+  // accepting nothing, and give the wait something to call (a watchdog kick /
+  // control-task service). Defaults keep a budget but no callback.
+  static void setWriteBudget(unsigned long ms) { s_writeBudgetMs = ms; }
+  static void setServiceCallback(void (*fn)()) { s_serviceFn = fn; }
+
+// Absolute ceiling on one whole response, however slowly the peer drips. Must be
+  // long enough for the largest legitimate body over the slowest link you care about.
+  static void setWriteTotalBudget(unsigned long ms) { s_writeTotalBudgetMs = ms; }
+
+  // True once a budget was exhausted and the response was abandoned. bytesSent()
+  // counts what the handler handed over, not what reached the peer, so a caller that
+  // logs or gates on it needs this to know the difference.
+  bool stalled() { return m_writeStalled; }
+
+ private:
   uint8_t * m_buffer;
   int m_bufferLength;
   int m_bufFill;
@@ -178,27 +239,28 @@ class Request : public Stream {
   enum MethodType { UNKNOWN, GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, ALL };
   void* context;
 
-  int available();
-  int availableForWrite();
+  int available() override;
+  int availableForWrite() DUE_COMPAT_OVERRIDE;
   int bytesRead();
   Stream* stream();
-  void flush();
+  void flush() override;
   bool form(char* name, int nameLength, char* value, int valueLength);
   char* get(const char* name);
   int left();
   MethodType method();
   char* path();
-  int peek();
+  int peek() override;
   void push(uint8_t ch);
   char* query();
   bool query(const char* name, char* buffer, int bufferLength);
-  int read();
+  int read() override;
   int read(uint8_t* buf, size_t size);
   bool route(const char* name, char* buffer, int bufferLength);
   bool route(int number, char* buffer, int bufferLength);
   int minorVersion();
-  size_t write(uint8_t data);
-  size_t write(uint8_t* buffer, size_t bufferLength);
+  size_t write(uint8_t data) override;
+  size_t write(const uint8_t* buffer, size_t bufferLength) override;
+  size_t write(uint8_t* buffer, size_t bufferLength); // non-override
 
  private:
   struct HeaderNode {
@@ -240,6 +302,29 @@ class Request : public Stream {
   char* m_query;
   int m_queryLength;
   bool m_readTimedout;
+
+  // TEG patch: slow-loris defense.
+  // Upstream has a per-BYTE timeout only, and Arduino's Stream::timedRead()
+  // busy-waits for it. A client sending one header byte just inside that window
+  // resets the timer every time, so the header phase never ends - and each wait
+  // burns a second of an 8s hardware watchdog with nothing servicing it. Eight
+  // dribbled bytes reset a running inverter.
+  //
+  // m_headerDeadline bounds the header phase as a whole. It deliberately does NOT
+  // apply once m_readingContent is set: a firmware upload is legitimately slow and
+  // its handler owns the watchdog from there.
+  unsigned long m_headerDeadline;
+  static unsigned long s_headerBudgetMs;
+  static void (*s_serviceFn)();
+
+ public:
+  // Bound the header phase and give the read loop something to call while it waits
+  // (a watchdog kick). Both optional; defaults keep upstream behaviour except for
+  // the deadline.
+  static void setHeaderBudget(unsigned long ms) { s_headerBudgetMs = ms; }
+  static void setServiceCallback(void (*fn)()) { s_serviceFn = fn; }
+
+ private:
   char* m_path;
   int m_pathLength;
   const char* m_pattern;
